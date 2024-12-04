@@ -5,8 +5,11 @@
 
 from ast import literal_eval
 
-from odoo.exceptions import ValidationError
+import psycopg2
+
+from odoo.exceptions import UserError, ValidationError
 from odoo.tests import Form, common, new_test_user
+from odoo.tools.misc import mute_logger
 
 from odoo.addons.base.models.ir_actions import IrActionsServer
 
@@ -27,11 +30,15 @@ class TestMassEditing(common.TransactionCase):
 
         self.MassEditingWizard = self.env["mass.editing.wizard"]
         self.ResPartnerTitle = self.env["res.partner.title"]
+        self.ResPartner = self.env["res.partner"]
         self.ResLang = self.env["res.lang"]
         self.IrActionsActWindow = self.env["ir.actions.act_window"]
 
         self.mass_editing_user = self.env.ref(
             "server_action_mass_edit.mass_editing_user"
+        )
+        self.mass_editing_partner = self.env.ref(
+            "server_action_mass_edit.mass_editing_partner"
         )
         self.mass_editing_partner_title = self.env.ref(
             "server_action_mass_edit.mass_editing_partner_title"
@@ -47,6 +54,7 @@ class TestMassEditing(common.TransactionCase):
             groups="base.group_system",
         )
         self.partner_title = self._create_partner_title()
+        self.invoice_partner = self._create_invoice_partner()
 
     def _create_partner_title(self):
         """Create a Partner Title."""
@@ -61,6 +69,14 @@ class TestMassEditing(common.TransactionCase):
             {"name": "Botschafter", "shortcut": "Bots."}
         )
         return partner_title
+
+    def _create_invoice_partner(self):
+        invoice_partner = self.ResPartner.create(
+            {
+                "type": "invoice",
+            }
+        )
+        return invoice_partner
 
     def _create_wizard_and_apply_values(self, server_action, items, vals):
         action = server_action.with_context(
@@ -150,6 +166,25 @@ class TestMassEditing(common.TransactionCase):
         self.assertTrue(
             "selection__email" in arch,
             "Fields view get must return architecture with fields" "created dynamicaly",
+        )
+
+        # test the code path where we extract an embedded tree for o2m fields
+        self.env["ir.ui.view"].search(
+            [
+                ("model", "in", ("res.partner.bank", "res.partner", "res.users")),
+                ("id", "!=", self.env.ref("base.res_partner_view_form_private").id),
+            ]
+        ).unlink()
+        self.env.ref("base.res_partner_view_form_private").model = "res.users"
+        result = self.MassEditingWizard.with_context(
+            server_action_id=self.mass_editing_user.id,
+            active_ids=[],
+        ).get_view()
+        arch = result.get("arch", "")
+        self.assertIn(
+            "<tree editable=",
+            arch,
+            "Fields view get must return architecture with embedded tree",
         )
 
     def test_wzd_clean_check_company_field_domain(self):
@@ -262,6 +297,36 @@ class TestMassEditing(common.TransactionCase):
         self._create_wizard_and_apply_values(self.mass_editing_user, self.user, vals)
         self.assertNotEqual(self.user.email, False, "User's Email should be set.")
 
+    def test_mass_edit_o2m_banks(self):
+        """Test Case for MASS EDITING which will remove and add
+        Partner's bank o2m."""
+        # Set another bank (must replace existing one)
+        bank_vals = {"acc_number": "account number"}
+        self.user.write(
+            {
+                "bank_ids": [(6, 0, []), (0, 0, bank_vals)],
+            }
+        )
+        vals = {
+            "selection__bank_ids": "set_o2m",
+            "bank_ids": [(0, 0, dict(bank_vals, acc_number="new number"))],
+        }
+        self._create_wizard_and_apply_values(self.mass_editing_user, self.user, vals)
+        self.assertEqual(self.user.bank_ids.acc_number, "new number")
+        # Add bank (must keep existing one)
+        vals = {
+            "selection__bank_ids": "add_o2m",
+            "bank_ids": [(0, 0, dict(bank_vals, acc_number="new number2"))],
+        }
+        self._create_wizard_and_apply_values(self.mass_editing_user, self.user, vals)
+        self.assertEqual(
+            self.user.bank_ids.mapped("acc_number"), ["new number", "new number2"]
+        )
+        # Set empty list (must remove all banks)
+        vals = {"selection__bank_ids": "set_o2m"}
+        self._create_wizard_and_apply_values(self.mass_editing_user, self.user, vals)
+        self.assertFalse(self.user.bank_ids)
+
     def test_mass_edit_m2m_categ(self):
         """Test Case for MASS EDITING which will remove and add
         Partner's category m2m."""
@@ -356,3 +421,37 @@ class TestMassEditing(common.TransactionCase):
             result,
             None,
         )
+
+    def test_mass_edit_partner_user_error(self):
+        vals = {
+            "selection__parent_id": "set",
+            "parent_id": self.invoice_partner.id,
+            "write_record_by_record": True,
+        }
+        action = self.mass_editing_partner.with_context(
+            active_model=self.invoice_partner._name,
+            active_ids=self.invoice_partner.ids,
+        ).run()
+        try:
+            self.env[action["res_model"]].with_context(
+                **literal_eval(action["context"]),
+            ).create(vals)
+        except Exception as e:
+            self.assertEqual(type(e), UserError)
+
+    def test_mass_edit_partner_sql_error(self):
+        vals = {
+            "selection__type": "set",
+            "type": "contact",
+            "write_record_by_record": True,
+            "selection__name": "remove",
+        }
+        action = self.mass_editing_partner.with_context(
+            active_model=self.invoice_partner._name,
+            active_ids=self.invoice_partner.ids,
+        ).run()
+        with self.assertRaises(psycopg2.IntegrityError):
+            with mute_logger("odoo.sql_db"), self.cr.savepoint():
+                self.env[action["res_model"]].with_context(
+                    **literal_eval(action["context"]),
+                ).create(vals)

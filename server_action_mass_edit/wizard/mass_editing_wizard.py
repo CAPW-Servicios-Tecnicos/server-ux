@@ -2,9 +2,25 @@
 # Copyright (C) 2020 Iván Todorovich (https://twitter.com/ivantodorovich)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
+import json
+import logging
+
 from lxml import etree
+from psycopg2 import IntegrityError
 
 from odoo import _, api, fields, models
+from odoo.exceptions import (
+    AccessDenied,
+    AccessError,
+    MissingError,
+    UserError,
+    ValidationError,
+)
+
+from odoo.addons.base.models.ir_ui_view import (
+    transfer_modifiers_to_node,
+    transfer_node_to_modifiers,
+)
 
 
 class MassEditingWizard(models.TransientModel):
@@ -17,6 +33,12 @@ class MassEditingWizard(models.TransientModel):
     operation_description_warning = fields.Text(readonly=True)
     operation_description_danger = fields.Text(readonly=True)
     message = fields.Text(readonly=True)
+    write_record_by_record = fields.Boolean(
+        help="This option will write the records one by one, instead of all at once.\n"
+        "This is useful when you are editing a lot of records and one of the "
+        "records raises an error. \n  With this option, the error message will be "
+        "more specific to facillitate the undertanding of the error."
+    )
 
     @api.model
     def default_get(self, fields, active_ids=None):
@@ -99,6 +121,12 @@ class MassEditingWizard(models.TransientModel):
                 ("remove_m2m", _("Remove")),
                 ("add", _("Add")),
             ]
+        elif field.ttype == "one2many":
+            selection = [
+                ("ignore", _("Don't touch")),
+                ("set_o2m", _("Set")),
+                ("add_o2m", _("Add")),
+            ]
         else:
             selection = [
                 ("ignore", _("Don't touch")),
@@ -142,7 +170,32 @@ class MassEditingWizard(models.TransientModel):
         field_vals = self._get_field_options(field)
         if line.widget_option:
             field_vals["widget"] = line.widget_option
-        etree.SubElement(div, "field", field_vals)
+        field_element = etree.SubElement(div, "field", field_vals)
+        if field.ttype == "one2many":
+            comodel = self.env[field.relation]
+            dummy, form_view = comodel._get_view(view_type="form")
+            dummy, tree_view = comodel._get_view(view_type="tree")
+            field_context = {}
+            if form_view:
+                field_context["form_view_ref"] = form_view.xml_id
+            if tree_view:
+                field_context["tree_view_ref"] = tree_view.xml_id
+            if field_context:
+                field_element.attrib["context"] = json.dumps(field_context)
+            else:
+                model_arch, dummy = self.env[field.model]._get_view(view_type="form")
+                embedded_tree = None
+                for node in model_arch.xpath(
+                    "//field[@name='%s'][./tree]" % field.name
+                ):
+                    embedded_tree = node.xpath("./tree")[0]
+                    break
+                if embedded_tree is not None:
+                    for node in embedded_tree.xpath("./*"):
+                        modifiers = {}
+                        transfer_node_to_modifiers(node, modifiers)
+                        transfer_modifiers_to_node(modifiers, node)
+                    field_element.insert(0, embedded_tree)
 
     def _get_field_options(self, field):
         return {
@@ -158,11 +211,19 @@ class MassEditingWizard(models.TransientModel):
         server_action = self.env["ir.actions.server"].sudo().browse(server_action_id)
         if not server_action:
             return super().get_view(view_id, view_type, **options)
+        # Clean form_view_ref to avoid use that instead of this model view
+        if self.env.context.get("form_view_ref"):
+            self = self.with_context(form_view_ref=None)
         result = super().get_view(view_id, view_type, **options)
         arch = etree.fromstring(result["arch"])
         main_xml_group = arch.find('.//group[@name="group_field_list"]')
         for line in server_action.mapped("mass_edit_line_ids"):
             self._insert_field_in_arch(line, line.field_id, main_xml_group)
+            if line.field_id.ttype == "one2many":
+                comodel = self.env[line.field_id.relation]
+                result["models"] = dict(
+                    result["models"], **{comodel._name: tuple(comodel.fields_get())}
+                )
         result["arch"] = etree.tostring(arch, encoding="unicode")
         return result
 
@@ -179,6 +240,7 @@ class MassEditingWizard(models.TransientModel):
             field_info = self._clean_check_company_field_domain(
                 self.env[server_action.model_id.model], field, fields_info[field.name]
             )
+            field_info["relation_field"] = False
             if not line.apply_domain and "domain" in field_info:
                 field_info["domain"] = "[]"
             res.update(self._prepare_fields(line, field, field_info))
@@ -199,18 +261,26 @@ class MassEditingWizard(models.TransientModel):
         return field_info
 
     @api.model_create_multi
-    def create(self, vals_list):
+    def create(self, vals_list):  # noqa: C901
         server_action_id = self.env.context.get("server_action_id")
         server_action = self.env["ir.actions.server"].sudo().browse(server_action_id)
         active_ids = self.env.context.get("active_ids", [])
         if server_action and active_ids:
+            TargetModel = self.env[server_action.model_id.model]
             for vals in vals_list:
+                write_record_by_record = vals.pop("write_record_by_record", False)
+                logging.warning("write_record_by_record: %s", write_record_by_record)
                 values = {}
                 for key, val in vals.items():
                     if key.startswith("selection_"):
                         split_key = key.split("__", 1)[1]
-                        if val == "set":
+                        if val == "set" or val == "add_o2m":
                             values.update({split_key: vals.get(split_key, False)})
+
+                        elif val == "set_o2m":
+                            values.update(
+                                {split_key: [(6, 0, [])] + vals.get(split_key, [])}
+                            )
 
                         elif val == "remove":
                             values.update({split_key: False})
@@ -230,10 +300,45 @@ class MassEditingWizard(models.TransientModel):
                             for m2m_id in vals.get(split_key, False)[0][2]:
                                 m2m_list.append((4, m2m_id))
                             values.update({split_key: m2m_list})
-                if values:
-                    self.env[server_action.model_id.model].browse(active_ids).write(
-                        values
-                    )
+
+                if not values:
+                    continue
+                target_records = TargetModel.browse(active_ids)
+                if write_record_by_record:
+                    for target_record in target_records:
+                        try:
+                            target_record.with_context(mass_edit=True).write(values)
+                        except (
+                            AccessDenied,
+                            AccessError,
+                            MissingError,
+                            UserError,
+                            ValidationError,
+                            IntegrityError,
+                        ) as oe:
+                            if isinstance(oe, IntegrityError):
+                                sql_error_msg_dict = models.convert_pgerror_constraint(
+                                    self.env[TargetModel._name],
+                                    False,
+                                    False,
+                                    oe,
+                                )
+                                sql_error_message = sql_error_msg_dict.get(
+                                    "message", ""
+                                )
+                                oe = Exception(sql_error_message)
+                            raise UserError(
+                                _(
+                                    'Failed to process the %(model_name)s  "%(name)s" '
+                                    "[id: %(id)s]:\n\n%(ue)s",
+                                    model_name=server_action.model_id.name,
+                                    name=target_record.display_name,
+                                    id=target_record.id,
+                                    ue=str(oe),
+                                )
+                            ) from oe
+                else:
+                    target_records.with_context(mass_edit=True).write(values)
         return super().create([{}])
 
     def _prepare_create_values(self, vals_list):

@@ -5,17 +5,25 @@ from odoo_test_helper import FakeModelLoader
 
 from odoo.tests import common
 
+from odoo.addons.base.tests.common import DISABLED_MAIL_CONTEXT
+
 
 class CommonTierValidation(common.TransactionCase):
     @classmethod
     def setUpClass(cls):
-        super(CommonTierValidation, cls).setUpClass()
-
+        super().setUpClass()
+        cls.env = cls.env(context=dict(cls.env.context, **DISABLED_MAIL_CONTEXT))
         cls.loader = FakeModelLoader(cls.env, cls.__module__)
         cls.loader.backup_registry()
-        from .tier_validation_tester import TierValidationTester, TierValidationTester2
+        from .tier_validation_tester import (
+            TierDefinition,
+            TierValidationTester,
+            TierValidationTester2,
+        )
 
-        cls.loader.update_registry((TierValidationTester, TierValidationTester2))
+        cls.loader.update_registry(
+            (TierValidationTester, TierValidationTester2, TierDefinition)
+        )
 
         cls.test_model = cls.env[TierValidationTester._name]
         cls.test_model_2 = cls.env[TierValidationTester2._name]
@@ -49,18 +57,41 @@ class CommonTierValidation(common.TransactionCase):
             }
         )
 
+        # Define views to avoid automatic views with all fields.
+        for model in cls.test_model._name, cls.test_model_2._name:
+            cls.env["ir.ui.view"].create(
+                {
+                    "model": model,
+                    "name": f"Demo view for {model}",
+                    "arch": """<form>
+                    <header>
+                        <button name="action_confirm" type="object" string="Confirm" />
+                        <field name="state" widget="statusbar" />
+                    </header>
+                    <sheet>
+                        <field name="test_field" />
+                    </sheet>
+                    </form>""",
+                }
+            )
+
         # Create users:
         group_ids = cls.env.ref("base.group_system").ids
         cls.test_user_1 = cls.env["res.users"].create(
-            {"name": "John", "login": "test1", "groups_id": [(6, 0, group_ids)]}
+            {
+                "name": "John",
+                "login": "test1",
+                "email": "john@yourcompany.example.com",
+                "groups_id": [(6, 0, group_ids)],
+            }
         )
         cls.test_user_2 = cls.env["res.users"].create(
-            {"name": "Mike", "login": "test2"}
+            {"name": "Mike", "login": "test2", "email": "mike@yourcompany.example.com"}
         )
 
         # Create tier definitions:
         cls.tier_def_obj = cls.env["tier.definition"]
-        cls.tier_def_obj.create(
+        cls.tier_definition = cls.tier_def_obj.create(
             {
                 "model_id": cls.tester_model.id,
                 "review_type": "individual",

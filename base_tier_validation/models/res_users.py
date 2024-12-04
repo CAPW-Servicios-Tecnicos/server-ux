@@ -28,11 +28,15 @@ class Users(models.Model):
                     .search([("id", "in", reviews.mapped("res_id"))])
                     .filtered(lambda x: not x.rejected and x.can_review)
                 )
-                # if len(records):
-                for rec in records:
+                # Excludes any cancelled records depending on the structure of the model
+                if self.env[model]._state_field in self.env[model]._fields:
+                    records = records.filtered(
+                        lambda x: x[x._state_field] != x._cancel_state
+                    )
+                if records:
                     record = self.env[model]
                     user_reviews[model] = {
-                        "id": rec.id,
+                        "id": records[0].id,
                         "name": record._description,
                         "model": model,
                         "active_field": "active" in record._fields,
