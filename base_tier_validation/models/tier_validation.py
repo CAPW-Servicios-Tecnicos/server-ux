@@ -12,7 +12,12 @@ from odoo.exceptions import ValidationError
 from odoo.osv.expression import OR
 from odoo.tools.misc import frozendict
 
-BASE_EXCEPTION_FIELDS = ["message_follower_ids", "access_token"]
+BASE_EXCEPTION_FIELDS = [
+    "message_main_attachment_id",
+    "message_follower_ids",
+    "access_token",
+    "need_validation",
+]
 
 
 class TierValidation(models.AbstractModel):
@@ -21,6 +26,7 @@ class TierValidation(models.AbstractModel):
 
     _tier_validation_buttons_xpath = "/form/header/button[last()]"
     _tier_validation_manual_config = True
+    _tier_validation_company_field = "company_id"
 
     _state_field = "state"
     _state_from = ["draft"]
@@ -70,6 +76,9 @@ class TierValidation(models.AbstractModel):
     )
     has_comment = fields.Boolean(compute="_compute_has_comment")
     next_review = fields.Char(compute="_compute_next_review")
+    is_reevaluation_required = fields.Boolean(
+        compute="_compute_is_reevaluation_required"
+    )
 
     def _compute_has_comment(self):
         for rec in self:
@@ -206,6 +215,27 @@ class TierValidation(models.AbstractModel):
             )[:1]
             rec.next_review = review and _("Next: %s") % review.name or ""
 
+    def _compute_is_reevaluation_required(self):
+        for rec in self:
+            if isinstance(rec.id, models.NewId):
+                rec.is_reevaluation_required = False
+                continue
+            tiers = (
+                self.env["tier.definition"]
+                .with_context(active_test=True)
+                .search(
+                    [
+                        ("model", "=", self._name),
+                        ("company_id", "in", [False] + rec._get_company().ids),
+                    ]
+                )
+            )
+            rec.is_reevaluation_required = False
+            valid_tiers = tiers.filtered(lambda x: rec.evaluate_tier(x))
+            if valid_tiers and rec.review_ids.definition_id:
+                if len(valid_tiers) != len(rec.review_ids.definition_id):
+                    rec.is_reevaluation_required = True
+
     @api.model
     def _calc_reviews_validated(self, reviews):
         """Override for different validation policy."""
@@ -229,14 +259,16 @@ class TierValidation(models.AbstractModel):
                 .search(
                     [
                         ("model", "=", self._name),
-                        ("company_id", "in", [False] + self.env.company.ids),
+                        ("company_id", "in", [False] + rec._get_company().ids),
                     ]
                 )
             )
-            valid_tiers = any([rec.evaluate_tier(tier) for tier in tiers])
-            rec.need_validation = (
-                not rec.review_ids and valid_tiers and rec._check_state_from_condition()
-            )
+            valid_tiers = tiers.filtered(lambda x: rec.evaluate_tier(x))
+            requested_tiers = rec.review_ids.filtered(
+                lambda x: x.status != "pending"
+            ).mapped("definition_id")
+            new_tiers = valid_tiers - requested_tiers
+            rec.need_validation = new_tiers and rec._check_state_from_condition()
 
     def evaluate_tier(self, tier):
         if tier.definition_domain:
@@ -254,7 +286,7 @@ class TierValidation(models.AbstractModel):
             .search(
                 [
                     ("model_name", "=", self._name),
-                    ("company_id", "in", [False] + self.env.company.ids),
+                    ("company_id", "in", [False] + self._get_company().ids),
                     "|",
                     ("group_ids", "in", self.env.user.groups_id.ids),
                     ("group_ids", "=", False),
@@ -610,6 +642,17 @@ class TierValidation(models.AbstractModel):
             "sequence": sequence,
         }
 
+    @api.model
+    def _get_company(self):
+        company_id = self.env.company
+        if (
+            self
+            and self._tier_validation_company_field in self.env[self._name]
+            and self[self._tier_validation_company_field]
+        ):
+            company_id = self[self._tier_validation_company_field]
+        return company_id
+
     def request_validation(self):
         td_obj = self.env["tier.definition"]
         tr_obj = self.env["tier.review"]
@@ -619,7 +662,8 @@ class TierValidation(models.AbstractModel):
                 tier_definitions = td_obj.search(
                     [
                         ("model", "=", self._name),
-                        ("company_id", "in", [False] + self.env.company.ids),
+                        ("company_id", "in", [False] + rec._get_company().ids),
+                        ("id", "not in", rec.review_ids.mapped("definition_id").ids),
                     ],
                     order="sequence desc",
                 )
@@ -628,8 +672,9 @@ class TierValidation(models.AbstractModel):
                     if rec.evaluate_tier(td):
                         sequence += 1
                         vals_list.append(rec._prepare_tier_review_vals(td, sequence))
-                self._update_counter({"review_created": True})
         created_trs = tr_obj.create(vals_list)
+        if any(self.mapped("can_review")):
+            self._update_counter({"review_created": True})
         self._notify_review_requested(created_trs)
         return created_trs
 
@@ -673,6 +718,13 @@ class TierValidation(models.AbstractModel):
                 if hasattr(self, subscribe):
                     getattr(self, subscribe)(partner_ids=partners_to_notify_ids)
                 rec._notify_restarted_review()
+
+    def reevaluate_reviews(self):
+        reviews = self.env["tier.review"]
+        for rec in self:
+            rec._compute_need_validation()
+            reviews += rec.request_validation()
+        return reviews
 
     @api.model
     def _update_counter(self, review_counter):

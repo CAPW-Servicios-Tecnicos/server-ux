@@ -127,11 +127,8 @@ class TierTierValidation(CommonTierValidation):
         )
         # Request validation
         self.test_record.with_user(self.test_user_2.id).request_validation()
-        self.test_record.invalidate_model()
         test_record.with_user(self.test_user_2.id).request_validation()
-        test_record.invalidate_model()
         self.test_record_2.with_user(self.test_user_2.id).request_validation()
-        self.test_record_2.invalidate_model()
         # Get review user count as systray icon would do and check count value
         docs = self.test_user_1.with_user(self.test_user_1).review_user_count()
         for doc in docs:
@@ -904,6 +901,154 @@ class TierTierValidation(CommonTierValidation):
                 {"test_validation_field": 4}
             )
         self.assertEqual(self.test_record.test_validation_field, 4)
+
+    def test_26_reevaluate_validation(self):
+        # Create new test record
+        test_record = self.test_model.create(
+            {"test_field": 100, "test_validation_field": 15}
+        )
+        # Create tier definitions
+        self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_field', '>', 100)]",
+            }
+        )
+        # Request validation
+        reviews = test_record.with_user(self.test_user_2.id).request_validation()
+        # Check need validation
+        self.assertTrue(test_record.need_validation)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews.definition_id, self.tier_definition)
+        self.assertEqual(len(test_record.review_ids), 1)
+        old_review = test_record.review_ids
+
+        # Now record is not validated yet and new definition create,
+        # and then we reevaluate object then it will add new definition validation
+        # also in current object
+        definition_extra = self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_validation_field', '>', 10)]",
+            }
+        )
+
+        # Reevaluate Validation
+        reviews = test_record.with_user(self.test_user_2.id).reevaluate_reviews()
+        # Check need validation
+        self.assertTrue(test_record.need_validation)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews.definition_id, definition_extra)
+        self.assertEqual(len(test_record.review_ids), 2)
+        self.assertIn(old_review, test_record.review_ids)
+
+    def test_27_reevaluate_validation(self):
+        # Create new test record
+        test_record = self.test_model.create(
+            {"test_field": 100, "test_validation_field": 15}
+        )
+        # Create tier definitions
+        # 1st defination to check test_field
+        self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('test_field', '>', 100)]",
+            }
+        )
+        # 2nd definition will be trigger only when there is
+        # new message with body "This record need extra validation"
+        test_message = "This record need extra validation"
+        self.tier_def_obj.create(
+            {
+                "model_id": self.tester_model.id,
+                "review_type": "individual",
+                "reviewer_id": self.test_user_1.id,
+                "definition_domain": "[('message_ids.body', 'ilike', '%s')]"
+                % (test_message),
+            }
+        )
+
+        # Request validation
+        reviews = test_record.with_user(self.test_user_2.id).request_validation()
+        # Check need validation
+        self.assertTrue(test_record.need_validation)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(len(test_record.review_ids), 1)
+        old_review = test_record.review_ids
+
+        # now post new message "This record need extra validation",
+        # it will need to reevaluate record and will add new tier validation
+        test_record.with_user(self.test_user_2.id).message_post(body=test_message)
+
+        # Reevaluate Validation
+        reviews = test_record.with_user(self.test_user_2.id).reevaluate_reviews()
+        # Check need validation
+        self.assertTrue(test_record.need_validation)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(len(test_record.review_ids), 2)
+        self.assertIn(old_review, test_record.review_ids)
+
+    def test_28_request_validation_diff_company(self):
+        """
+        Test validation request behavior with multi-company setup.
+
+        Setup:
+        - Main company has 2 tier definitions:
+          - One for User1 (sequence 30)
+          - One for User3 (sequence 20)
+        - Other company has 1 tier definition:
+          - One for User3 (sequence 30)
+
+        When record's company is set to 'other company':
+        - Only User3's tier definition from other company should be applied
+        - Should create only 1 review
+        """
+        self.assertFalse(self.test_record_2.review_ids)
+        self.assertFalse(self.test_record_2.company_id)
+        self.assertEqual(self.test_user_3_multi_company.env.company, self.main_company)
+
+        self.test_record_2.company_id = self.other_company
+
+        reviews = self.test_record_2.with_user(
+            self.test_user_3_multi_company.id
+        ).request_validation()
+        self.test_record_2.invalidate_recordset()
+
+        self.assertEqual(len(reviews), 1)
+
+    def test_29_request_validation_same_company(self):
+        """
+        Test validation request behavior with multi-company setup.
+
+        Setup:
+        - Main company has 2 tier definitions:
+          - One for User1 (sequence 30)
+          - One for User3 (sequence 20)
+        - Other company has 1 tier definition:
+          - One for User3 (sequence 30)
+
+        When record's company is set to 'main company':
+        - Both User1 and User3's tier definitions from main company should be applied
+        - Should create 2 reviews
+        """
+        self.assertFalse(self.test_record_2.review_ids)
+        self.assertFalse(self.test_record_2.company_id)
+        self.assertEqual(self.test_user_3_multi_company.env.company, self.main_company)
+
+        self.test_record_2.company_id = self.main_company
+
+        reviews = self.test_record_2.with_user(
+            self.test_user_3_multi_company.id
+        ).request_validation()
+        self.test_record_2.invalidate_recordset()
+
+        self.assertEqual(len(reviews), 2)
 
 
 @tagged("at_install")
